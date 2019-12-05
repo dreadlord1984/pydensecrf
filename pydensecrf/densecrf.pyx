@@ -8,7 +8,7 @@ import eigen
 cimport eigen
 
 
-cdef LabelCompatibility* _labelcomp(compat):
+cdef LabelCompatibility* _labelcomp(compat) except NULL:
     if isinstance(compat, Number):
         return new PottsCompatibility(compat)
     elif memoryview(compat).ndim == 1:
@@ -17,6 +17,7 @@ cdef LabelCompatibility* _labelcomp(compat):
         return new MatrixCompatibility(eigen.c_matrixXf(compat))
     else:
         raise ValueError("LabelCompatibility of dimension >2 not meaningful.")
+    return NULL  # Important for the exception(s) to propagate!
 
 
 cdef class Unary:
@@ -58,6 +59,9 @@ cdef class DenseCRF:
         else:
             self._this = NULL
 
+        self._nvar = nvar
+        self._nlabel = nlabels
+
     def __dealloc__(self):
         # Because destructors are virtual, this is enough to delete any object
         # of child classes too.
@@ -65,12 +69,20 @@ cdef class DenseCRF:
             del self._this
 
     def addPairwiseEnergy(self, float[:,::1] features not None, compat, KernelType kernel=DIAG_KERNEL, NormalizationType normalization=NORMALIZE_SYMMETRIC):
+        if features.shape[1] != self._nvar:
+            raise ValueError("Bad shape for pairwise energy (Need (?, {}), got {})".format(self._nvar, (features.shape[0], features.shape[1])))
+
         self._this.addPairwiseEnergy(eigen.c_matrixXf(features), _labelcomp(compat), kernel, normalization)
 
     def setUnary(self, Unary u):
         self._this.setUnaryEnergy(u.move())
 
     def setUnaryEnergy(self, float[:,::1] u not None, float[:,::1] f = None):
+        if u.shape[0] != self._nlabel or u.shape[1] != self._nvar:
+            raise ValueError("Bad shape for unary energy (Need {}, got {})".format((self._nlabel, self._nvar), (u.shape[0], u.shape[1])))
+        # TODO: I don't remember the exact shape `f` should have, so I'm not putting an assertion here.
+        #       If you get hit by a wrong shape of `f`, please open an issue with the necessary info!
+
         if f is None:
             self._this.setUnaryEnergy(eigen.c_matrixXf(u))
         else:
@@ -96,6 +108,15 @@ cdef class DenseCRF2D(DenseCRF):
         if type(self) is DenseCRF2D:
             self._this = self._this2d = new c_DenseCRF2D(w, h, nlabels)
 
+        # Unfortunately, self._this2d.W_ and .H_ are protected in C++ and thus
+        # we cannot access them from here for sanity-checks, so keep our own...
+        self._w = w
+        self._h = h
+
+        # Also set these for the superclass
+        self._nvar = w*h
+        self._nlabel = nlabels
+
     def addPairwiseGaussian(self, sxy, compat, KernelType kernel=DIAG_KERNEL, NormalizationType normalization=NORMALIZE_SYMMETRIC):
         if isinstance(sxy, Number):
             sxy = (sxy, sxy)
@@ -108,6 +129,11 @@ cdef class DenseCRF2D(DenseCRF):
 
         if isinstance(srgb, Number):
             srgb = (srgb, srgb, srgb)
+
+        if rgbim.shape[0] != self._h or rgbim.shape[1] != self._w:
+            raise ValueError("Bad shape for pairwise bilateral (Need {}, got {})".format((self._h, self._w, 3), rgbim.shape))
+        if rgbim.shape[2] != 3:
+            raise ValueError("addPairwiseBilateral only works for RGB images. For other types, use `utils.create_pairwise_bilateral` to construct your own pairwise energy and add it through `addPairwiseEnergy`.")
 
         self._this2d.addPairwiseBilateral(
             sxy[0], sxy[1], srgb[0], srgb[1], srgb[2], &rgbim[0,0,0], _labelcomp(compat), kernel, normalization
